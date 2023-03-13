@@ -1,10 +1,13 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Iterable, Union
+from typing import Dict, List, Literal, Optional, Iterable, Set, Tuple, Union
+import numpy as np
 import numpy.typing as npt
 import gmsh
 from .importers import import_from_gmsh
 
+
+ArrayType = Union[npt.NDArray[np.float64], Tuple[float, float]]
 
 class DimType(Enum):
     POINT = 0
@@ -41,7 +44,7 @@ class Field(MeshTransaction):
 
 @dataclass
 class Point(MeshTransaction):
-    coord: npt.NDArray
+    coord: npt.NDArray[np.float64]
     "coordinate of point"
     mesh_size: float
     "mesh size for point"
@@ -80,14 +83,11 @@ class Line(MeshTransaction):
 
 @dataclass
 class CurveLoop(MeshTransaction):
-    coords: npt.NDArray
+    groups: Dict[str, Iterable[ArrayType]]
     "2D array of coordinate points"
 
     mesh_size: Union[float, List[float]]
     "Mesh size for points, If list, must be same length as coords."
-
-    labels: Dict[str, Union[Iterable[Union[Line, int]], Literal["all"]]] = field(default_factory=dict)
-    "Label for physical group lines"
 
     fields: List[Field] = field(default_factory=list)
     "fields to be added to the curve loop"
@@ -105,19 +105,35 @@ class CurveLoop(MeshTransaction):
 
         self.points: List[Point] = []
         self.lines: List[Line] = []
+        self.markers: Dict[str, List[Line]] = {}
+        added_points: Dict[Tuple, Point] = {}
 
-        for i, coord in enumerate(self.coords):
-            # getting mesh size for point
-            mesh_size = self.mesh_size[i] if isinstance(self.mesh_size, List) else self.mesh_size
+        for i, (label, coords) in enumerate(self.groups.items()):
+            lines: List[Line] = []
+            for j, coord in enumerate(coords):
+                # get mesh size for point
+                mesh_size = self.mesh_size[i] if isinstance(self.mesh_size, List) else self.mesh_size
 
-            # adding points
-            self.points.append(Point(coord, mesh_size))
+                # convert coord to numpy array if it isn't and store point lookup key
+                coord = np.asarray(coord)
+                point_key = tuple(coord)
+                
+                # create point and add to lookup if it hasn't been added, otherwise lookup point
+                if point_key not in added_points:
+                    point = Point(coord, mesh_size)
+                    added_points[point_key] = point
+                else:
+                    point = added_points[point_key]
 
-            # adding lines to connect points
-            if i > 0:
-                self.lines.append(Line(self.points[i-1], self.points[i]))
-            if i == len(self.coords) - 1:
-                self.lines.append(Line(self.points[i], self.points[0]))
+                # adding lines to connect points
+                if len(self.points) > 0:
+                    lines.append(Line(self.points[-1], point))
+                
+                # store point
+                self.points.append(point)
+
+            self.lines += lines
+            self.markers[label] = lines
 
     def before_sync(self):
         if not self.before_sync_initiated:
@@ -132,8 +148,8 @@ class CurveLoop(MeshTransaction):
         super().before_sync()
 
     def after_sync(self):
-        if not self.after_sync_initiated and self.labels:
-            for (name, label_lines) in self.labels.items():
+        if not self.after_sync_initiated and self.markers:
+            for (name, label_lines) in self.markers.items():
                 if label_lines == "all":
                     label_line_tags = self.line_tags
                 else:
@@ -287,6 +303,8 @@ class Geometry:
             transactions.after_sync()
         gmsh.model.mesh.generate()
         gmsh.option.set_number("Mesh.SaveAll", 1)
-        return import_from_gmsh(gmsh.model)
+        mesh = import_from_gmsh(gmsh.model)
+        return mesh
+
     def write(self, filename: str):
         gmsh.write(filename)
